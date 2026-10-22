@@ -1,0 +1,34 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Databases (personal data - never commit) ----
+*.db
+*.sqlite
+*.sqlite3
+
+# ---- Generated logs and reports ----
+chart_debug.log
+diagnose_report.txt
+diagnose_chart.png
+
+# ---- Build / binaries ----
+build/
+dist/
+*.exe
+*.o
+*.obj
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Local scratch files ----
+_preview_*.png
