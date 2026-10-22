@@ -2,6 +2,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3
 import csv
+import math
+import os
+import sys
+import traceback
 from datetime import datetime
 
 
@@ -9,7 +13,12 @@ from datetime import datetime
 # DATABASE SETTINGS
 # ============================================================
 
-DATABASE = "expenses.db"
+# Keep the database next to the script so the app works no matter
+# from which folder it is launched.
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATABASE = os.path.join(BASE_DIR, "expenses.db")
 
 CATEGORIES = [
     "Food",
@@ -18,6 +27,102 @@ CATEGORIES = [
     "Fees",
     "Others"
 ]
+
+
+# ============================================================
+# CHART SETTINGS
+# ============================================================
+
+CHART_COLORS = {
+    "Food": "#FF6B6B",
+    "Travel": "#4ECDC4",
+    "Shopping": "#FFD166",
+    "Fees": "#6C5CE7",
+    "Others": "#9B8AFB"
+}
+
+CHART_BG = "#FFFFFF"
+CHART_GRID = "#EAE7F7"
+CHART_AXIS = "#8B8AA3"
+CHART_TEXT = "#3D3B5C"
+CHART_FONT = "Segoe UI"
+
+TREND_COLORS = [
+    "#6C5CE7",
+    "#4ECDC4",
+    "#FF6B6B",
+    "#FFD166",
+    "#9B8AFB",
+    "#00B894",
+    "#E17055",
+    "#0984E3"
+]
+
+# Any chart problem is written here so it can be inspected even when
+# the app was started from VS Code without a visible console.
+
+CHART_LOG = os.path.join(BASE_DIR, "chart_debug.log")
+
+
+def log_debug(message):
+    """
+    Append a timestamped line to chart_debug.log.
+    """
+
+    try:
+
+        with open(CHART_LOG, "a", encoding="utf-8") as log_file:
+
+            log_file.write(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n"
+            )
+
+    except Exception:
+
+        pass
+
+
+def nice_ceiling(value, steps=5):
+    """
+    Round a raw maximum up to a friendly axis maximum so that the
+    chart gets evenly spaced, readable grid lines.
+    """
+
+    if value <= 0:
+        return float(steps)
+
+    raw = value / steps
+
+    exponent = math.floor(math.log10(raw))
+
+    base = 10 ** exponent
+
+    for factor in (1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10):
+
+        if raw <= factor * base:
+
+            return factor * base * steps
+
+    return 10 * base * steps
+
+
+def format_compact(amount):
+    """
+    Short money format used for axis labels and bar captions.
+    """
+
+    amount = float(amount)
+
+    if abs(amount) >= 10000000:
+        return f"₹{amount / 10000000:.2f}Cr"
+
+    if abs(amount) >= 100000:
+        return f"₹{amount / 100000:.2f}L"
+
+    if abs(amount) >= 1000:
+        return f"₹{amount / 1000:.1f}K"
+
+    return f"₹{amount:.0f}"
 
 
 def connect_database():
@@ -113,15 +218,22 @@ class ExpenseTracker:
 
         self.root.title("Personal Expense Tracker")
 
-        self.root.geometry("1150x760")
-
-        self.root.minsize(1000, 650)
-
         self.root.configure(
             bg="#F4F2FF"
         )
 
+        # Chart window state
+        self.chart_window = None
+        self.chart_canvases = {}
+        self.chart_log_scale = tk.BooleanVar(value=False)
+        self.chart_use_filter = tk.BooleanVar(value=True)
+        self.chart_redraw_job = None
+
         self.create_styles()
+
+        self.fit_window_to_screen()
+
+        self.create_menu()
 
         self.create_header()
 
@@ -131,11 +243,221 @@ class ExpenseTracker:
 
         self.create_search_section()
 
-        self.create_table()
+        # Buttons are packed BEFORE the table so they can never be
+        # pushed off screen - the table is the only part that shrinks.
 
         self.create_buttons()
 
+        self.create_table()
+
+        self.create_shortcuts()
+
         self.refresh_all()
+
+        # Bring the window to the front so the in-app shortcuts
+        # (Ctrl+G, Ctrl+M, F5) work immediately instead of being
+        # captured by whichever editor had focus.
+
+        self.root.after(200, self.take_focus)
+
+
+    # ========================================================
+    # FOCUS
+    # ========================================================
+
+    def take_focus(self):
+
+        try:
+
+            self.root.deiconify()
+
+            self.root.lift()
+
+            self.root.focus_force()
+
+        except tk.TclError:
+
+            pass
+
+
+    # ========================================================
+    # WINDOW SIZING
+    # ========================================================
+
+    def fit_window_to_screen(self):
+        """
+        Size the window so it always fits the visible screen area.
+
+        The taskbar and the window title bar both eat vertical space,
+        so we keep a generous margin. On a 1280x720 display this
+        produces roughly 1000x580 - safely above the taskbar.
+        """
+
+        screen_width = self.root.winfo_screenwidth()
+
+        screen_height = self.root.winfo_screenheight()
+
+        width = min(1060, screen_width - 80)
+
+        height = min(700, screen_height - 140)
+
+        x = max(0, (screen_width - width) // 2)
+
+        y = max(0, (screen_height - height) // 2 - 22)
+
+        self.root.geometry(
+            f"{width}x{height}+{x}+{y}"
+        )
+
+        self.root.minsize(
+            min(860, width),
+            min(480, height)
+        )
+
+
+    # ========================================================
+    # MENU BAR
+    # ========================================================
+
+    def create_menu(self):
+
+        menu_bar = tk.Menu(
+            self.root
+        )
+
+
+        file_menu = tk.Menu(
+            menu_bar,
+            tearoff=0
+        )
+
+        file_menu.add_command(
+            label="Export to CSV...",
+            command=self.export_csv
+        )
+
+        file_menu.add_separator()
+
+        file_menu.add_command(
+            label="Exit",
+            command=self.root.destroy
+        )
+
+        menu_bar.add_cascade(
+            label="File",
+            menu=file_menu
+        )
+
+
+        view_menu = tk.Menu(
+            menu_bar,
+            tearoff=0
+        )
+
+        view_menu.add_command(
+            label="Show Chart          Ctrl+G",
+            command=self.show_chart
+        )
+
+        view_menu.add_command(
+            label="Monthly Summary     Ctrl+M",
+            command=self.monthly_summary
+        )
+
+        view_menu.add_separator()
+
+        view_menu.add_command(
+            label="Refresh             F5",
+            command=self.refresh_all
+        )
+
+        menu_bar.add_cascade(
+            label="View",
+            menu=view_menu
+        )
+
+
+        data_menu = tk.Menu(
+            menu_bar,
+            tearoff=0
+        )
+
+        data_menu.add_command(
+            label="Add Demo Data",
+            command=self.add_demo_data
+        )
+
+        data_menu.add_command(
+            label="Clear All Data",
+            command=self.clear_all
+        )
+
+        menu_bar.add_cascade(
+            label="Data",
+            menu=data_menu
+        )
+
+
+        help_menu = tk.Menu(
+            menu_bar,
+            tearoff=0
+        )
+
+        help_menu.add_command(
+            label="About",
+            command=self.show_about
+        )
+
+        menu_bar.add_cascade(
+            label="Help",
+            menu=help_menu
+        )
+
+
+        self.root.config(
+            menu=menu_bar
+        )
+
+
+    # ========================================================
+    # KEYBOARD SHORTCUTS
+    # ========================================================
+
+    def create_shortcuts(self):
+
+        self.root.bind(
+            "<Control-g>",
+            lambda event: self.show_chart()
+        )
+
+        self.root.bind(
+            "<Control-G>",
+            lambda event: self.show_chart()
+        )
+
+        self.root.bind(
+            "<Control-m>",
+            lambda event: self.monthly_summary()
+        )
+
+        self.root.bind(
+            "<F5>",
+            lambda event: self.refresh_all()
+        )
+
+
+    def show_about(self):
+
+        messagebox.showinfo(
+            "About",
+            "Personal Expense Tracker\n\n"
+            "Keep track of your daily expenses and\n"
+            "view category and monthly charts.\n\n"
+            "Shortcuts:\n"
+            "  Ctrl+G  - Show charts\n"
+            "  Ctrl+M  - Monthly summary\n"
+            "  F5      - Refresh table"
+        )
 
 
     # ========================================================
@@ -150,7 +472,7 @@ class ExpenseTracker:
 
         style.configure(
             "Treeview",
-            rowheight=32,
+            rowheight=28,
             font=("Arial", 10)
         )
 
@@ -162,7 +484,7 @@ class ExpenseTracker:
         style.configure(
             "TButton",
             font=("Arial", 10, "bold"),
-            padding=7
+            padding=5
         )
 
 
@@ -175,7 +497,7 @@ class ExpenseTracker:
         header = tk.Frame(
             self.root,
             bg="#6C5CE7",
-            height=85
+            height=70
         )
 
         header.pack(
@@ -187,11 +509,11 @@ class ExpenseTracker:
             text="PERSONAL EXPENSE TRACKER",
             bg="#6C5CE7",
             fg="white",
-            font=("Arial", 25, "bold")
+            font=("Arial", 21, "bold")
         )
 
         title.pack(
-            pady=(15, 2)
+            pady=(8, 1)
         )
 
         subtitle = tk.Label(
@@ -219,7 +541,7 @@ class ExpenseTracker:
         summary_frame.pack(
             fill="x",
             padx=15,
-            pady=12
+            pady=8
         )
 
         self.summary_labels = {}
@@ -273,7 +595,7 @@ class ExpenseTracker:
             )
 
             value.pack(
-                pady=(0, 8)
+                pady=(0, 6)
             )
 
             self.summary_labels[item] = value
@@ -291,13 +613,13 @@ class ExpenseTracker:
             bg="#F4F2FF",
             font=("Arial", 11, "bold"),
             padx=10,
-            pady=10
+            pady=6
         )
 
         input_frame.pack(
             fill="x",
             padx=15,
-            pady=5
+            pady=4
         )
 
 
@@ -434,7 +756,7 @@ class ExpenseTracker:
         search_frame.pack(
             fill="x",
             padx=15,
-            pady=8
+            pady=6
         )
 
 
@@ -651,7 +973,7 @@ class ExpenseTracker:
         button_frame.pack(
             fill="x",
             padx=15,
-            pady=10
+            pady=8
         )
 
 
@@ -858,6 +1180,12 @@ class ExpenseTracker:
 
         self.update_summary()
 
+        # Keep an open chart window in sync with the table
+
+        if self.chart_window is not None and self.chart_window.winfo_exists():
+
+            self.refresh_charts()
+
 
     # ========================================================
     # LOAD TABLE
@@ -942,6 +1270,10 @@ class ExpenseTracker:
                 get_all_expenses()
             )
 
+            if self.chart_window is not None and self.chart_window.winfo_exists():
+
+                self.refresh_charts()
+
             return
 
 
@@ -994,6 +1326,10 @@ class ExpenseTracker:
             matching_records
         )
 
+        if self.chart_window is not None and self.chart_window.winfo_exists():
+
+            self.refresh_charts()
+
 
         # NO RESULTS
 
@@ -1020,6 +1356,10 @@ class ExpenseTracker:
                 get_all_expenses()
             )
 
+            if self.chart_window is not None and self.chart_window.winfo_exists():
+
+                self.refresh_charts()
+
             return
 
 
@@ -1041,6 +1381,10 @@ class ExpenseTracker:
         self.load_table(
             filtered_records
         )
+
+        if self.chart_window is not None and self.chart_window.winfo_exists():
+
+            self.refresh_charts()
 
 
     # ========================================================
@@ -1070,7 +1414,28 @@ class ExpenseTracker:
         values = item["values"]
 
 
+        if not values:
+
+            messagebox.showwarning(
+                "No Selection",
+                "That row has no usable data."
+            )
+
+            return
+
+
+        # Treeview always returns strings, but the id column is an
+        # INTEGER PRIMARY KEY - cast it back so the delete always matches.
+
         expense_id = values[0]
+
+        try:
+
+            expense_id = int(expense_id)
+
+        except (TypeError, ValueError):
+
+            pass
 
 
         confirm = messagebox.askyesno(
@@ -1212,14 +1577,7 @@ class ExpenseTracker:
         records = get_all_expenses()
 
 
-        current_month = datetime.now().strftime(
-            "%m-%Y"
-        )
-
-
-        total = 0
-
-        count = 0
+        buckets = {}
 
 
         for record in records:
@@ -1231,26 +1589,82 @@ class ExpenseTracker:
                     "%d-%m-%Y"
                 )
 
-
-                if expense_date.strftime(
-                    "%m-%Y"
-                ) == current_month:
-
-                    total += record[2]
-
-                    count += 1
-
-
-            except ValueError:
+            except (ValueError, TypeError):
 
                 continue
 
 
+            key = expense_date.strftime("%m-%Y")
+
+
+            if key not in buckets:
+
+                buckets[key] = {
+                    "label": expense_date.strftime("%B %Y"),
+                    "total": 0.0,
+                    "count": 0
+                }
+
+
+            buckets[key]["total"] += record[2]
+
+            buckets[key]["count"] += 1
+
+
+        if not buckets:
+
+            messagebox.showinfo(
+                "Monthly Summary",
+                "There are no expenses yet."
+            )
+
+            return
+
+
+        current_month = datetime.now().strftime(
+            "%m-%Y"
+        )
+
+
+        # Show the current month, but fall back to the newest month
+        # that actually has data instead of showing a useless zero.
+
+        if current_month in buckets:
+
+            key = current_month
+
+        else:
+
+            key = max(
+                buckets,
+                key=lambda month: datetime.strptime(
+                    month,
+                    "%m-%Y"
+                )
+            )
+
+
+        data = buckets[key]
+
+
+        message = (
+            f"Month: {data['label']}\n\n"
+            f"Number of Expenses: {data['count']}\n"
+            f"Total Spent: ₹{data['total']:,.2f}"
+        )
+
+
+        if key != current_month:
+
+            message += (
+                "\n\n(No expenses recorded in the current month,"
+                "\nso the latest month with data is shown.)"
+            )
+
+
         messagebox.showinfo(
             "Monthly Summary",
-            f"Month: {current_month}\n\n"
-            f"Number of Expenses: {count}\n"
-            f"Total Spent: ₹{total:.2f}"
+            message
         )
 
 
@@ -1336,21 +1750,503 @@ class ExpenseTracker:
 
 
     # ========================================================
-    # SHOW CHART
+    # CHART WINDOW
     # ========================================================
 
     def show_chart(self):
+        """
+        Safe entry point for opening the chart window. Any failure is
+        reported to the user and written to chart_debug.log instead of
+        silently showing a blank window.
+        """
+
+        try:
+
+            self.build_chart_window()
+
+        except Exception as error:
+
+            log_debug(
+                f"show_chart failed: {error}\n{traceback.format_exc()}"
+            )
+
+            if self.chart_window is not None:
+
+                try:
+
+                    self.chart_window.destroy()
+
+                except Exception:
+
+                    pass
+
+                self.chart_window = None
+
+                self.chart_canvases = {}
+
+            messagebox.showerror(
+                "Chart Error",
+                "Could not open the chart window.\n\n"
+                f"{error}\n\n"
+                "Technical details were saved to:\n"
+                f"{CHART_LOG}"
+            )
+
+
+    def build_chart_window(self):
+
+        # Reuse the window if it is already open
+
+        if self.chart_window is not None and self.chart_window.winfo_exists():
+
+            self.chart_window.deiconify()
+
+            self.chart_window.lift()
+
+            self.chart_window.focus_force()
+
+            self.refresh_charts()
+
+            return
+
+
+        chart_window = tk.Toplevel(self.root)
+
+        chart_window.title("Expense Analytics")
+
+        chart_window.configure(bg=CHART_BG)
+
+        chart_window.transient(self.root)
+
+
+        # Keep the chart window inside the visible screen area
+
+        screen_width = self.root.winfo_screenwidth()
+
+        screen_height = self.root.winfo_screenheight()
+
+        chart_width = min(980, screen_width - 80)
+
+        chart_height = min(640, screen_height - 140)
+
+
+        chart_window.geometry(
+            f"{chart_width}x{chart_height}"
+            f"+{max(0, (screen_width - chart_width) // 2)}"
+            f"+{max(0, (screen_height - chart_height) // 2 - 20)}"
+        )
+
+        chart_window.minsize(
+            min(840, chart_width),
+            min(520, chart_height)
+        )
+
+        self.chart_window = chart_window
+
+        self.chart_canvases = {}
+
+
+        # ---------- TITLE ROW ----------
+
+        title_row = tk.Frame(
+            chart_window,
+            bg=CHART_BG
+        )
+
+        title_row.pack(
+            fill="x",
+            padx=18,
+            pady=(16, 8)
+        )
+
+
+        tk.Label(
+            title_row,
+            text="Expense Analytics",
+            bg=CHART_BG,
+            fg=CHART_TEXT,
+            font=("Arial", 18, "bold")
+        ).pack(
+            side="left"
+        )
+
+
+        self.chart_info_label = tk.Label(
+            title_row,
+            text="",
+            bg=CHART_BG,
+            fg="#6C5CE7",
+            font=("Arial", 11, "bold")
+        )
+
+        self.chart_info_label.pack(
+            side="right"
+        )
+
+
+        # ---------- TABS ----------
+
+        notebook = ttk.Notebook(
+            chart_window
+        )
+
+        notebook.pack(
+            fill="both",
+            expand=True,
+            padx=18,
+            pady=(0, 10)
+        )
+
+
+        tabs = [
+            ("Category Chart", "bar"),
+            ("Pie Chart", "pie"),
+            ("Monthly Trend", "trend")
+        ]
+
+        for tab_name, key in tabs:
+
+            tab_frame = tk.Frame(
+                notebook,
+                bg=CHART_BG
+            )
+
+            notebook.add(
+                tab_frame,
+                text=tab_name
+            )
+
+            canvas = tk.Canvas(
+                tab_frame,
+                bg=CHART_BG,
+                highlightthickness=0
+            )
+
+            canvas.pack(
+                fill="both",
+                expand=True,
+                padx=10,
+                pady=10
+            )
+
+            canvas.bind(
+                "<Configure>",
+                self.schedule_chart_redraw
+            )
+
+            self.chart_canvases[key] = canvas
+
+
+        notebook.bind(
+            "<<NotebookTabChanged>>",
+            self.on_chart_tab_changed
+        )
+
+
+        # ---------- CONTROLS ----------
+
+        control_row = tk.Frame(
+            chart_window,
+            bg=CHART_BG
+        )
+
+        control_row.pack(
+            fill="x",
+            padx=18,
+            pady=(0, 14)
+        )
+
+
+        ttk.Checkbutton(
+            control_row,
+            text="Log scale (make small categories visible)",
+            variable=self.chart_log_scale,
+            command=self.refresh_charts
+        ).pack(
+            side="left"
+        )
+
+
+        ttk.Checkbutton(
+            control_row,
+            text="Use current filter / search",
+            variable=self.chart_use_filter,
+            command=self.refresh_charts
+        ).pack(
+            side="left",
+            padx=18
+        )
+
+
+        ttk.Button(
+            control_row,
+            text="🔄 Refresh Charts",
+            command=self.refresh_charts
+        ).pack(
+            side="left"
+        )
+
+
+        ttk.Button(
+            control_row,
+            text="❌ Close",
+            command=self.close_chart
+        ).pack(
+            side="right"
+        )
+
+
+        chart_window.protocol(
+            "WM_DELETE_WINDOW",
+            self.close_chart
+        )
+
+
+        # ---------- FORCE TO FRONT ----------
+        #
+        # Some Windows setups (high DPI scaling, windowed VS Code)
+        # create the window behind the main window, which looks like
+        # "the chart does not open". A short topmost pulse fixes that.
+
+        chart_window.deiconify()
+
+        chart_window.update_idletasks()
+
+        chart_window.lift()
+
+        chart_window.focus_force()
+
+
+        def release_topmost():
+
+            try:
+
+                if chart_window.winfo_exists():
+
+                    chart_window.attributes(
+                        "-topmost",
+                        False
+                    )
+
+            except tk.TclError:
+
+                pass
+
+
+        try:
+
+            chart_window.attributes(
+                "-topmost",
+                True
+            )
+
+            chart_window.after(
+                600,
+                release_topmost
+            )
+
+        except tk.TclError:
+
+            pass
+
+
+        log_debug(
+            f"chart opened: python={sys.version.split()[0]} "
+            f"tk={tk.TkVersion} "
+            f"screen={screen_width}x{screen_height} "
+            f"scaling={self.root.tk.call('tk', 'scaling'):.2f} "
+            f"window={chart_width}x{chart_height} "
+            f"records={len(get_all_expenses())}"
+        )
+
+
+        # Draw as soon as the window is on screen
+
+        chart_window.after(
+            120,
+            self.refresh_charts
+        )
+
+
+    # ========================================================
+    # CLOSE CHART WINDOW
+    # ========================================================
+
+    def close_chart(self):
+
+        if self.chart_window is not None and self.chart_window.winfo_exists():
+
+            self.chart_window.destroy()
+
+        self.chart_window = None
+
+        self.chart_canvases = {}
+
+
+    # ========================================================
+    # CHART REDRAW HELPERS
+    # ========================================================
+
+    def schedule_chart_redraw(self, event=None):
+
+        if self.chart_redraw_job is not None:
+
+            try:
+
+                self.root.after_cancel(
+                    self.chart_redraw_job
+                )
+
+            except Exception:
+
+                pass
+
+
+        self.chart_redraw_job = self.root.after(
+            120,
+            self.refresh_charts
+        )
+
+
+    def on_chart_tab_changed(self, event=None):
+
+        self.schedule_chart_redraw()
+
+
+    def refresh_charts(self):
+
+        self.chart_redraw_job = None
+
+        if self.chart_window is None or not self.chart_window.winfo_exists():
+
+            return
+
+
+        records = self.get_chart_records()
+
+        totals = self.get_chart_totals(records)
+
+        total_amount = sum(totals.values())
+
+        if totals:
+
+            top_category = max(
+                totals,
+                key=totals.get
+            )
+
+            self.chart_info_label.config(
+                text=(
+                    f"Total: ₹{total_amount:,.2f}   |   "
+                    f"Records: {len(records)}   |   "
+                    f"Top: {top_category}"
+                )
+            )
+
+        else:
+
+            self.chart_info_label.config(
+                text="Total: ₹0.00   |   Records: 0"
+            )
+
+
+        chart_jobs = (
+            ("bar", "Category chart", self.draw_bar_chart),
+            ("pie", "Pie chart", self.draw_pie_chart),
+            ("trend", "Monthly trend", self.draw_trend_chart)
+        )
+
+
+        for key, title, draw in chart_jobs:
+
+            canvas = self.chart_canvases.get(key)
+
+            if canvas is None:
+
+                continue
+
+            try:
+
+                draw(canvas)
+
+            except Exception as error:
+
+                # Never leave a silent blank canvas behind.
+
+                log_debug(
+                    f"{key} chart failed: {error}\n"
+                    f"{traceback.format_exc()}"
+                )
+
+                self.draw_error_chart(
+                    canvas,
+                    title,
+                    error
+                )
+
+
+    # ========================================================
+    # CHART DATA
+    # ========================================================
+
+    def get_chart_records(self):
+        """
+        Records used for the charts. When the filter option is on,
+        the current category filter and search keyword are applied.
+        """
 
         records = get_all_expenses()
 
+        if not self.chart_use_filter.get():
+
+            return records
+
+
+        category = self.filter_combo.get()
+
+        keyword = self.search_entry.get().strip().lower()
+
+
+        if category == "All" and keyword == "":
+
+            return records
+
+
+        filtered = []
+
+        for record in records:
+
+            if category != "All" and record[3] != category:
+
+                continue
+
+
+            if keyword:
+
+                haystack = " ".join(
+                    str(value).lower()
+                    for value in record[1:]
+                )
+
+                if keyword not in haystack:
+
+                    continue
+
+
+            filtered.append(record)
+
+
+        return filtered
+
+
+    def get_chart_totals(self, records):
+        """
+        Category wise total of the given records.
+        """
 
         totals = {
-
-            "Food": 0,
-            "Travel": 0,
-            "Shopping": 0,
-            "Fees": 0,
-            "Others": 0
+            category: 0.0
+            for category in CATEGORIES
         }
 
 
@@ -1361,139 +2257,829 @@ class ExpenseTracker:
             amount = record[2]
 
 
-            if category in totals:
+            if category not in totals:
 
-                totals[category] += amount
+                totals[category] = 0.0
 
 
-        chart_window = tk.Toplevel(
-            self.root
+            totals[category] += amount
+
+
+        # Drop empty categories so the chart stays clean
+
+        return {
+            category: amount
+            for category, amount in totals.items()
+            if amount > 0
+        }
+
+
+    def get_monthly_totals(self, records):
+        """
+        Month wise totals, sorted from oldest to newest.
+        """
+
+        buckets = {}
+
+
+        for record in records:
+
+            try:
+
+                expense_date = datetime.strptime(
+                    record[1],
+                    "%d-%m-%Y"
+                )
+
+            except (ValueError, TypeError):
+
+                continue
+
+
+            key = expense_date.strftime("%m-%Y")
+
+            if key not in buckets:
+
+                buckets[key] = {
+                    "label": expense_date.strftime("%b %Y"),
+                    "amount": 0.0,
+                    "count": 0
+                }
+
+
+            buckets[key]["amount"] += record[2]
+
+            buckets[key]["count"] += 1
+
+
+        ordered = sorted(
+            buckets.items(),
+            key=lambda item: datetime.strptime(
+                item[0],
+                "%m-%Y"
+            )
         )
 
-        chart_window.title(
-            "Expense Category Chart"
+
+        return [
+            (
+                data["label"],
+                data["amount"],
+                data["count"]
+            )
+            for key, data in ordered
+        ]
+
+
+    # ========================================================
+    # DRAWING HELPERS
+    # ========================================================
+
+    def get_canvas_size(self, canvas):
+
+        width = canvas.winfo_width()
+
+        height = canvas.winfo_height()
+
+
+        if width < 100 or height < 100:
+
+            width = canvas.winfo_reqwidth()
+
+            height = canvas.winfo_reqheight()
+
+
+        if width < 100 or height < 100:
+
+            width = 900
+
+            height = 420
+
+
+        return width, height
+
+
+    def draw_empty_chart(self, canvas, message):
+
+        canvas.delete("all")
+
+        width, height = self.get_canvas_size(canvas)
+
+        canvas.create_text(
+            width / 2,
+            height / 2 - 12,
+            text=message,
+            font=(CHART_FONT, 14, "bold"),
+            fill=CHART_AXIS
         )
 
-        chart_window.geometry(
-            "800x450"
-        )
-
-        chart_window.configure(
-            bg="white"
-        )
-
-
-        tk.Label(
-            chart_window,
-            text="Category-wise Expense Chart",
-            bg="white",
-            font=("Arial", 18, "bold")
-        ).pack(
-            pady=15
+        canvas.create_text(
+            width / 2,
+            height / 2 + 16,
+            text="Use 'Add Demo Data' or add an expense to get started.",
+            font=(CHART_FONT, 10),
+            fill="#AAAAAA"
         )
 
 
-        canvas = tk.Canvas(
-            chart_window,
-            width=750,
-            height=350,
-            bg="white"
+    def draw_error_chart(self, canvas, title, error):
+        """
+        Show the failure reason on the canvas so it is visible even
+        when the app runs without a console (e.g. inside VS Code).
+        """
+
+        try:
+
+            canvas.delete("all")
+
+        except Exception:
+
+            return
+
+        width, height = self.get_canvas_size(canvas)
+
+        canvas.create_text(
+            width / 2,
+            height / 2 - 30,
+            text=f"{title} could not be drawn",
+            font=(CHART_FONT, 14, "bold"),
+            fill="#C0392B"
         )
 
-        canvas.pack()
+        canvas.create_text(
+            width / 2,
+            height / 2 + 2,
+            text=f"{type(error).__name__}: {error}",
+            font=(CHART_FONT, 10),
+            fill=CHART_TEXT,
+            width=max(200, width - 80)
+        )
 
-
-        values = list(
-            totals.values()
+        canvas.create_text(
+            width / 2,
+            height / 2 + 60,
+            text=f"Details saved to: {CHART_LOG}",
+            font=(CHART_FONT, 9),
+            fill=CHART_AXIS
         )
 
 
-        maximum = max(
-            values
-        ) if values else 0
+    def draw_axis_label(self, canvas, x, y, text, anchor="center", color=CHART_AXIS, size=9, bold=False):
+
+        canvas.create_text(
+            x,
+            y,
+            text=text,
+            anchor=anchor,
+            font=(
+                CHART_FONT,
+                size,
+                "bold" if bold else "normal"
+            ),
+            fill=color
+        )
 
 
-        if maximum == 0:
+    # ========================================================
+    # CATEGORY BAR CHART
+    # ========================================================
 
-            canvas.create_text(
-                375,
-                170,
-                text="No expense data available",
-                font=("Arial", 14)
+    def draw_bar_chart(self, canvas):
+
+        canvas.delete("all")
+
+        width, height = self.get_canvas_size(canvas)
+
+        records = self.get_chart_records()
+
+        totals = self.get_chart_totals(records)
+
+
+        if not totals:
+
+            self.draw_empty_chart(
+                canvas,
+                "No expense data to plot"
             )
 
             return
 
 
-        categories = list(
-            totals.keys()
+        total_amount = sum(totals.values())
+
+        max_amount = max(totals.values())
+
+
+        left = 86
+        right = 26
+        top = 44
+        bottom = 76
+
+        plot_width = width - left - right
+
+        plot_height = height - top - bottom
+
+
+        if plot_width <= 60 or plot_height <= 60:
+
+            return
+
+
+        axis_max = nice_ceiling(max_amount)
+
+        use_log = self.chart_log_scale.get()
+
+
+        # ------- HEADER LINE -------
+
+        self.draw_axis_label(
+            canvas,
+            left,
+            18,
+            (
+                f"Category wise spending   |   "
+                f"Axis max ₹{axis_max:,.0f}"
+                + ("   |   LOG SCALE" if use_log else "")
+            ),
+            anchor="w",
+            color="#6C5CE7",
+            size=10,
+            bold=True
         )
 
 
-        bar_width = 75
+        # ------- GRID LINES + Y AXIS LABELS -------
 
-        gap = 50
+        steps = 5
 
-        start_x = 45
+        for i in range(steps + 1):
 
-        bottom_y = 280
+            fraction = i / steps
 
-        max_height = 210
+            y = top + plot_height - fraction * plot_height
+
+            canvas.create_line(
+                left,
+                y,
+                left + plot_width,
+                y,
+                fill=CHART_GRID,
+                width=1
+            )
+
+            self.draw_axis_label(
+                canvas,
+                left - 10,
+                y,
+                format_compact(axis_max * fraction),
+                anchor="e"
+            )
 
 
-        for i, category in enumerate(
-            categories
-        ):
+        # ------- AXES -------
 
-            amount = totals[
-                category
+        canvas.create_line(
+            left,
+            top,
+            left,
+            top + plot_height,
+            fill=CHART_AXIS,
+            width=2
+        )
+
+        canvas.create_line(
+            left,
+            top + plot_height,
+            left + plot_width,
+            top + plot_height,
+            fill=CHART_AXIS,
+            width=2
+        )
+
+
+        # ------- BARS -------
+
+        categories = list(totals.keys())
+
+        slot = plot_width / len(categories)
+
+        bar_width = max(18, min(96, slot * 0.55))
+
+        if use_log and max_amount > 0:
+
+            denominator = math.log10(max_amount + 1)
+
+            def height_fraction(amount):
+
+                return (
+                    math.log10(amount + 1) / denominator
+                    if denominator
+                    else 0
+                )
+
+        else:
+
+            def height_fraction(amount):
+
+                return amount / axis_max if axis_max else 0
+
+
+        baseline = top + plot_height
+
+
+        for index, category in enumerate(categories):
+
+            amount = totals[category]
+
+            fraction = height_fraction(amount)
+
+            # Never let a real category collapse into an invisible
+            # sliver - the exact value is printed above the bar.
+
+            bar_height = max(fraction * plot_height, 10)
+
+            center_x = left + slot * (index + 0.5)
+
+            x1 = center_x - bar_width / 2
+
+            x2 = center_x + bar_width / 2
+
+            y1 = baseline - bar_height
+
+            color = CHART_COLORS.get(
+                category,
+                "#6C5CE7"
+            )
+
+
+            # BAR BODY
+
+            canvas.create_rectangle(
+                x1,
+                y1,
+                x2,
+                baseline,
+                fill=color,
+                outline="",
+                tags=("bar",)
+            )
+
+
+            # VALUE ON TOP
+
+            self.draw_axis_label(
+                canvas,
+                center_x,
+                y1 - 14,
+                format_compact(amount),
+                color=CHART_TEXT,
+                size=10,
+                bold=True
+            )
+
+
+            # PERCENTAGE UNDER THE BAR
+
+            percentage = (
+                amount / total_amount * 100
+                if total_amount
+                else 0
+            )
+
+            self.draw_axis_label(
+                canvas,
+                center_x,
+                baseline + 18,
+                f"{percentage:.1f}%",
+                size=9
+            )
+
+
+            # CATEGORY NAME
+
+            self.draw_axis_label(
+                canvas,
+                center_x,
+                baseline + 40,
+                category,
+                color=CHART_TEXT,
+                size=11,
+                bold=True
+            )
+
+
+        # ------- FOOTER -------
+
+        self.draw_axis_label(
+            canvas,
+            left,
+            height - 14,
+            (
+                f"Total ₹{total_amount:,.2f}   |   "
+                f"Entries {len(records)}   |   "
+                "Tip: enable log scale to compare small categories"
+            ),
+            anchor="w",
+            size=9
+        )
+
+
+    # ========================================================
+    # PIE CHART
+    # ========================================================
+
+    def draw_pie_chart(self, canvas):
+
+        canvas.delete("all")
+
+        width, height = self.get_canvas_size(canvas)
+
+        records = self.get_chart_records()
+
+        totals = self.get_chart_totals(records)
+
+
+        if not totals:
+
+            self.draw_empty_chart(
+                canvas,
+                "No expense data to plot"
+            )
+
+            return
+
+
+        total_amount = sum(totals.values())
+
+        legend_width = 250
+
+        area_width = width - legend_width
+
+        center_x = area_width / 2
+
+        center_y = height / 2
+
+        radius = max(
+            40,
+            min(area_width, height) / 2 - 46
+        )
+
+
+        self.draw_axis_label(
+            canvas,
+            20,
+            18,
+            "Category share of total spending",
+            anchor="w",
+            color="#6C5CE7",
+            size=10,
+            bold=True
+        )
+
+
+        # ------- PIE SLICES -------
+
+        start_angle = 90.0
+
+        for category, amount in totals.items():
+
+            fraction = amount / total_amount if total_amount else 0
+
+            extent = fraction * 360
+
+            if extent >= 360:
+
+                extent = 359.9
+
+
+            color = CHART_COLORS.get(
+                category,
+                "#6C5CE7"
+            )
+
+
+            canvas.create_arc(
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+                start=start_angle,
+                extent=-extent,
+                fill=color,
+                outline="white",
+                width=2,
+                style="pieslice"
+            )
+
+
+            start_angle -= extent
+
+
+        # ------- CENTRE TEXT -------
+
+        canvas.create_oval(
+            center_x - radius * 0.42,
+            center_y - radius * 0.42,
+            center_x + radius * 0.42,
+            center_y + radius * 0.42,
+            fill=CHART_BG,
+            outline=""
+        )
+
+        self.draw_axis_label(
+            canvas,
+            center_x,
+            center_y - 8,
+            "TOTAL",
+            color=CHART_AXIS,
+            size=10
+        )
+
+        self.draw_axis_label(
+            canvas,
+            center_x,
+            center_y + 14,
+            format_compact(total_amount),
+            color=CHART_TEXT,
+            size=13,
+            bold=True
+        )
+
+
+        # ------- LEGEND -------
+
+        legend_x = width - legend_width + 24
+
+        legend_top = center_y - len(totals) * 26 + 8
+
+        legend_y = legend_top
+
+        for category, amount in totals.items():
+
+            color = CHART_COLORS.get(
+                category,
+                "#6C5CE7"
+            )
+
+            percentage = (
+                amount / total_amount * 100
+                if total_amount
+                else 0
+            )
+
+
+            canvas.create_rectangle(
+                legend_x,
+                legend_y - 8,
+                legend_x + 16,
+                legend_y + 8,
+                fill=color,
+                outline=""
+            )
+
+            self.draw_axis_label(
+                canvas,
+                legend_x + 26,
+                legend_y - 6,
+                category,
+                anchor="w",
+                color=CHART_TEXT,
+                size=11,
+                bold=True
+            )
+
+            self.draw_axis_label(
+                canvas,
+                legend_x + 26,
+                legend_y + 12,
+                f"₹{amount:,.0f}   ({percentage:.1f}%)",
+                anchor="w",
+                size=9
+            )
+
+            legend_y += 46
+
+
+    # ========================================================
+    # MONTHLY TREND CHART
+    # ========================================================
+
+    def draw_trend_chart(self, canvas):
+
+        canvas.delete("all")
+
+        width, height = self.get_canvas_size(canvas)
+
+        records = self.get_chart_records()
+
+        monthly = self.get_monthly_totals(records)
+
+
+        if not monthly:
+
+            self.draw_empty_chart(
+                canvas,
+                "No monthly data to plot"
+            )
+
+            return
+
+
+        left = 86
+        right = 26
+        top = 44
+        bottom = 76
+
+        plot_width = width - left - right
+
+        plot_height = height - top - bottom
+
+
+        if plot_width <= 60 or plot_height <= 60:
+
+            return
+
+
+        max_amount = max(
+            item[1]
+            for item in monthly
+        )
+
+        axis_max = nice_ceiling(max_amount)
+
+        total_amount = sum(
+            item[1]
+            for item in monthly
+        )
+
+
+        self.draw_axis_label(
+            canvas,
+            left,
+            18,
+            (
+                f"Monthly spending trend   |   "
+                f"{len(monthly)} month(s)   |   "
+                f"Axis max ₹{axis_max:,.0f}"
+            ),
+            anchor="w",
+            color="#6C5CE7",
+            size=10,
+            bold=True
+        )
+
+
+        # ------- GRID LINES + Y AXIS -------
+
+        steps = 5
+
+        for i in range(steps + 1):
+
+            fraction = i / steps
+
+            y = top + plot_height - fraction * plot_height
+
+            canvas.create_line(
+                left,
+                y,
+                left + plot_width,
+                y,
+                fill=CHART_GRID,
+                width=1
+            )
+
+            self.draw_axis_label(
+                canvas,
+                left - 10,
+                y,
+                format_compact(axis_max * fraction),
+                anchor="e"
+            )
+
+
+        canvas.create_line(
+            left,
+            top,
+            left,
+            top + plot_height,
+            fill=CHART_AXIS,
+            width=2
+        )
+
+        canvas.create_line(
+            left,
+            top + plot_height,
+            left + plot_width,
+            top + plot_height,
+            fill=CHART_AXIS,
+            width=2
+        )
+
+
+        # ------- MONTH BARS -------
+
+        slot = plot_width / len(monthly)
+
+        bar_width = max(14, min(80, slot * 0.5))
+
+        baseline = top + plot_height
+
+        points = []
+
+
+        for index, (label, amount, count) in enumerate(monthly):
+
+            fraction = amount / axis_max if axis_max else 0
+
+            bar_height = max(fraction * plot_height, 10)
+
+            center_x = left + slot * (index + 0.5)
+
+            x1 = center_x - bar_width / 2
+
+            x2 = center_x + bar_width / 2
+
+            y1 = baseline - bar_height
+
+            color = TREND_COLORS[
+                index % len(TREND_COLORS)
             ]
-
-
-            bar_height = (
-                amount / maximum
-            ) * max_height
-
-
-            x1 = (
-                start_x
-                + i * (bar_width + gap)
-            )
-
-            y1 = (
-                bottom_y
-                - bar_height
-            )
-
-            x2 = x1 + bar_width
-
-            y2 = bottom_y
 
 
             canvas.create_rectangle(
                 x1,
                 y1,
                 x2,
-                y2,
-                fill="#6C5CE7",
+                baseline,
+                fill=color,
                 outline=""
             )
 
 
-            canvas.create_text(
-                (x1 + x2) / 2,
-                y1 - 12,
-                text=f"₹{amount:.0f}",
-                font=("Arial", 10, "bold")
+            self.draw_axis_label(
+                canvas,
+                center_x,
+                y1 - 14,
+                format_compact(amount),
+                color=CHART_TEXT,
+                size=9,
+                bold=True
+            )
+
+            self.draw_axis_label(
+                canvas,
+                center_x,
+                baseline + 18,
+                label,
+                color=CHART_TEXT,
+                size=9,
+                bold=True
+            )
+
+            self.draw_axis_label(
+                canvas,
+                center_x,
+                baseline + 36,
+                f"{count} entr{'y' if count == 1 else 'ies'}",
+                size=8
+            )
+
+            points.append((center_x, y1))
+
+
+        # ------- TREND LINE -------
+
+        if len(points) > 1:
+
+            flat_points = []
+
+            for x, y in points:
+
+                flat_points.append(x)
+                flat_points.append(y)
+
+
+            canvas.create_line(
+                *flat_points,
+                fill="#FF6B6B",
+                width=2,
+                dash=(4, 3)
             )
 
 
-            canvas.create_text(
-                (x1 + x2) / 2,
-                bottom_y + 20,
-                text=category,
-                font=("Arial", 10)
-            )
+        # ------- FOOTER -------
+
+        self.draw_axis_label(
+            canvas,
+            left,
+            height - 14,
+            (
+                f"Total ₹{total_amount:,.2f}   |   "
+                f"Monthly average ₹{total_amount / len(monthly):,.2f}"
+            ),
+            anchor="w",
+            size=9
+        )
 
 
 # ============================================================

@@ -1,0 +1,9 @@
+# This project uses only the Python standard library.
+#
+# Tkinter, sqlite3, csv, math and os ship with Python itself,
+# so there is nothing to install.
+#
+# Just run:
+#     python app.py
+#
+# No entries are required in this file.
